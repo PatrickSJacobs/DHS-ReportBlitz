@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use tauri::{Emitter, Manager};
 //use tokio::sync::mpsc;
+use serde_json::json;
 use std::env;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -17,8 +18,11 @@ use tauri_plugin_http::init as http_init;
 use tauri_plugin_opener::init as opener_init;
 use tauri_plugin_shell::init as shell_init;
 use tauri_plugin_store::StoreExt;
-use serde_json::json;
-
+// Use these v2 imports instead
+use tauri::menu::{Menu, MenuEvent, MenuItemBuilder};
+use tauri::tray::TrayIconBuilder;
+use tauri::Wry;
+use tauri::{AppHandle, Runtime};
 
 // App state structure
 use std::sync::atomic::AtomicBool;
@@ -32,8 +36,9 @@ pub struct AppState {
 
 // Function to get the API key from the secure store
 // Function to get the API key from the secure store
-fn get_api_key(app_handle: &tauri::AppHandle) -> Result<String> {
-    // Get the store from the app's resource table - handle the Result
+// Update the function signature to use the generic type
+fn get_api_key<R: Runtime>(app_handle: &AppHandle<R>) -> Result<String> {
+    // The rest of the function remains the same
     let store = match app_handle.store("api_keys.dat") {
         Ok(store) => store,
         Err(e) => {
@@ -41,7 +46,7 @@ fn get_api_key(app_handle: &tauri::AppHandle) -> Result<String> {
             return Ok(String::new());
         }
     };
-    
+
     // Try to get the API key from the store
     match store.get("openai_api_key") {
         Some(key) => {
@@ -51,10 +56,10 @@ fn get_api_key(app_handle: &tauri::AppHandle) -> Result<String> {
                     return Ok(key_str.to_string());
                 }
             }
-        },
+        }
         None => (),
     }
-    
+
     // If not in store, check environment variable
     if let Ok(key) = env::var("OPENAI_API_KEY") {
         if !key.is_empty() {
@@ -67,13 +72,13 @@ fn get_api_key(app_handle: &tauri::AppHandle) -> Result<String> {
             return Ok(key);
         }
     }
-    
+
     // Final fallback: check .env file
     let env_path = get_env_file_path()?;
     if env_path.exists() {
         if let Ok(file) = File::open(env_path) {
             let reader = BufReader::new(file);
-            
+
             for line_result in reader.lines() {
                 if let Ok(line) = line_result {
                     if line.starts_with("OPENAI_API_KEY=") {
@@ -92,7 +97,7 @@ fn get_api_key(app_handle: &tauri::AppHandle) -> Result<String> {
             }
         }
     }
-    
+
     println!("No API key found");
     Ok(String::new())
 }
@@ -111,7 +116,7 @@ struct TranscriptionResponse {
 
 // Command to get the current shortcut configuration
 #[tauri::command]
-fn get_shortcut_config(state: tauri::State<AppState>) -> ShortcutConfig {
+fn get_shortcut_config(state: tauri::State<'_, AppState>) -> ShortcutConfig {
     ShortcutConfig {
         _shortcut: state._shortcut.lock().unwrap().clone(),
         _hold_shortcut: state._hold_shortcut.lock().unwrap().clone(),
@@ -123,8 +128,8 @@ fn get_shortcut_config(state: tauri::State<AppState>) -> ShortcutConfig {
 #[tauri::command]
 fn update_shortcut_config(
     _shortcut: String,
-    app_handle: tauri::AppHandle,
-    state: tauri::State<AppState>,
+    app_handle: AppHandle<Wry>,
+    state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
     let new_shortcut = "super+KeyG".to_string();
     *state._shortcut.lock().unwrap() = new_shortcut.clone();
@@ -139,15 +144,18 @@ fn update_shortcut_config(
 fn get_env_file_path() -> Result<PathBuf> {
     // Get the executable path
     let current_exe = std::env::current_exe()?;
-    let exe_dir = current_exe.parent().ok_or_else(|| anyhow!("Failed to get executable directory"))?;
-    
+    let exe_dir = current_exe
+        .parent()
+        .ok_or_else(|| anyhow!("Failed to get executable directory"))?;
+
     // For macOS, the Resources directory is at ../Resources relative to the executable
     #[cfg(target_os = "macos")]
     {
         if let Some(resources_dir) = exe_dir
             .parent() // Go up from MacOS
             .and_then(|p| p.parent()) // Go up from Contents
-            .map(|p| p.join("Resources")) // Go to Resources
+            .map(|p| p.join("Resources"))
+        // Go to Resources
         {
             let env_path = resources_dir.join(".env");
             println!("Looking for .env file at: {:?}", env_path);
@@ -156,7 +164,7 @@ fn get_env_file_path() -> Result<PathBuf> {
             }
         }
     }
-    
+
     // For Windows/Linux, resources are typically in the same directory as the executable
     #[cfg(not(target_os = "macos"))]
     {
@@ -169,14 +177,14 @@ fn get_env_file_path() -> Result<PathBuf> {
             }
         }
     }
-    
+
     // Development path - check src-tauri directory
     let dev_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".env");
     println!("Looking for .env file at: {:?}", dev_path);
     if dev_path.exists() {
         return Ok(dev_path);
     }
-    
+
     // Fallback to executable directory
     let default_path = exe_dir.join(".env");
     println!("No .env file found, using default path: {:?}", default_path);
@@ -184,8 +192,8 @@ fn get_env_file_path() -> Result<PathBuf> {
 }
 
 // Function to update the global shortcut
-fn update_global_shortcut(
-    app_handle: &tauri::AppHandle,
+fn update_global_shortcut<R: Runtime>(
+    app_handle: &AppHandle<R>,
     toggle_shortcut: &str,
     hold_shortcut: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -209,7 +217,11 @@ use std::time::{Duration, Instant};
 use std::sync::atomic::Ordering;
 
 // Then modify your handle_shortcut function
-fn handle_shortcut(app_handle: &tauri::AppHandle, shortcut: &Shortcut, state: ShortcutState) {
+fn handle_shortcut<R: Runtime>(
+    app_handle: &AppHandle<R>,
+    shortcut: &Shortcut,
+    state: ShortcutState,
+) {
     let now = Instant::now();
     let shortcut_str = shortcut.to_string();
     let app_state = app_handle.state::<AppState>();
@@ -288,7 +300,7 @@ fn handle_shortcut(app_handle: &tauri::AppHandle, shortcut: &Shortcut, state: Sh
 }
 
 // Optimized record_audio_internal function
-fn record_audio_internal(app_handle: tauri::AppHandle) -> Result<()> {
+fn record_audio_internal<R: Runtime>(app_handle: AppHandle<R>) -> Result<()> {
     let state = app_handle.state::<AppState>();
     let is_recording = state.is_recording.clone();
 
@@ -311,24 +323,26 @@ fn record_audio_internal(app_handle: tauri::AppHandle) -> Result<()> {
 
             // For optimization, we'll use a fixed configuration that's good enough for speech
             // instead of always using the maximum sample rate
-            let target_sample_rate = 24000; // 16kHz is sufficient for speech recognition
-            
+            let target_sample_rate = 17000; // 16kHz is sufficient for speech recognition
+
             // Find a suitable configuration with reasonable sample rate
             let supported_config = match device.supported_input_configs() {
                 Ok(configs) => {
                     let mut best_config = None;
-                    
+
                     for config_range in configs.filter(|c| c.channels() == 1) {
                         let min_rate = config_range.min_sample_rate().0;
                         let max_rate = config_range.max_sample_rate().0;
-                        
+
                         // Select the config that can support our target rate
                         if min_rate <= target_sample_rate && max_rate >= target_sample_rate {
-                            best_config = Some(config_range.with_sample_rate(cpal::SampleRate(target_sample_rate)));
+                            best_config = Some(
+                                config_range.with_sample_rate(cpal::SampleRate(target_sample_rate)),
+                            );
                             break;
                         }
                     }
-                    
+
                     // If we didn't find a config that supports our exact target,
                     // just choose one with the closest sample rate
                     if best_config.is_none() {
@@ -358,7 +372,7 @@ fn record_audio_internal(app_handle: tauri::AppHandle) -> Result<()> {
                             Err(_) => None,
                         };
                     }
-                    
+
                     match best_config {
                         Some(config) => config,
                         None => {
@@ -384,12 +398,13 @@ fn record_audio_internal(app_handle: tauri::AppHandle) -> Result<()> {
             // Use a more efficient buffer approach to reduce mutex contention
             // Pre-allocate with a reasonable size based on typical recording duration
             let capacity = sample_rate as usize * 60; // 1 minute of audio at our sample rate
-            let all_samples: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::with_capacity(capacity)));
+            let all_samples: Arc<Mutex<Vec<f32>>> =
+                Arc::new(Mutex::new(Vec::with_capacity(capacity)));
             let all_samples_clone = all_samples.clone();
 
             // Create batching for samples to reduce mutex contention
-            let batch_size = sample_rate as usize / 4; // 0.25 seconds worth of samples
-            
+            let batch_size = sample_rate as usize / 10; // 0.25 seconds worth of samples
+
             // Error callback
             let err_fn = |err| {
                 eprintln!("Stream error: {:?}", err);
@@ -406,13 +421,13 @@ fn record_audio_internal(app_handle: tauri::AppHandle) -> Result<()> {
                     let is_rec = is_recording.clone();
                     let mut batch: Vec<f32> = Vec::with_capacity(batch_size);
                     let last_log_time = Arc::new(Mutex::new(std::time::Instant::now()));
-                    
+
                     let callback = move |data: &[f32], _: &_| {
                         if is_rec.load(Ordering::SeqCst) {
                             if !data.is_empty() {
                                 // Collect samples to batch before locking mutex
                                 batch.extend_from_slice(data);
-                                
+
                                 // Only lock the mutex and push when we have a full batch
                                 if batch.len() >= batch_size {
                                     let now = std::time::Instant::now();
@@ -421,10 +436,10 @@ fn record_audio_internal(app_handle: tauri::AppHandle) -> Result<()> {
                                         println!("Audio batch collected: {} samples", batch.len());
                                         *last_log = now;
                                     }
-                                    
+
                                     let mut buffer = samples.lock().unwrap();
                                     buffer.append(&mut batch);
-                                    
+
                                     // Reset the batch with the same capacity
                                     batch = Vec::with_capacity(batch_size);
                                 }
@@ -446,13 +461,13 @@ fn record_audio_internal(app_handle: tauri::AppHandle) -> Result<()> {
                     let is_rec = is_recording.clone();
                     let mut batch: Vec<f32> = Vec::with_capacity(batch_size);
                     let last_log_time = Arc::new(Mutex::new(std::time::Instant::now()));
-                    
+
                     let callback = move |data: &[i16], _: &_| {
                         if is_rec.load(Ordering::SeqCst) {
                             if !data.is_empty() {
                                 // Convert and collect samples in batch
                                 batch.extend(data.iter().map(|&s| s as f32 / i16::MAX as f32));
-                                
+
                                 // Only lock the mutex when batch is full
                                 if batch.len() >= batch_size {
                                     let now = std::time::Instant::now();
@@ -461,10 +476,10 @@ fn record_audio_internal(app_handle: tauri::AppHandle) -> Result<()> {
                                         println!("Audio batch collected: {} samples", batch.len());
                                         *last_log = now;
                                     }
-                                    
+
                                     let mut buffer = samples.lock().unwrap();
                                     buffer.append(&mut batch);
-                                    
+
                                     // Reset the batch
                                     batch = Vec::with_capacity(batch_size);
                                 }
@@ -486,14 +501,16 @@ fn record_audio_internal(app_handle: tauri::AppHandle) -> Result<()> {
                     let is_rec = is_recording.clone();
                     let mut batch: Vec<f32> = Vec::with_capacity(batch_size);
                     let last_log_time = Arc::new(Mutex::new(std::time::Instant::now()));
-                    
+
                     let callback = move |data: &[u16], _: &_| {
                         if is_rec.load(Ordering::SeqCst) {
                             if !data.is_empty() {
                                 // Convert and collect samples in batch
-                                batch.extend(data.iter()
-                                    .map(|&s| (s as f32 / u16::MAX as f32) * 2.0 - 1.0));
-                                
+                                batch.extend(
+                                    data.iter()
+                                        .map(|&s| (s as f32 / u16::MAX as f32) * 2.0 - 1.0),
+                                );
+
                                 // Only lock the mutex when batch is full
                                 if batch.len() >= batch_size {
                                     let now = std::time::Instant::now();
@@ -502,10 +519,10 @@ fn record_audio_internal(app_handle: tauri::AppHandle) -> Result<()> {
                                         println!("Audio batch collected: {} samples", batch.len());
                                         *last_log = now;
                                     }
-                                    
+
                                     let mut buffer = samples.lock().unwrap();
                                     buffer.append(&mut batch);
-                                    
+
                                     // Reset the batch
                                     batch = Vec::with_capacity(batch_size);
                                 }
@@ -617,7 +634,7 @@ fn record_audio_internal(app_handle: tauri::AppHandle) -> Result<()> {
 
 // Command to record audio
 #[tauri::command]
-fn record_audio(app_handle: tauri::AppHandle) -> Result<(), String> {
+fn record_audio(app_handle: AppHandle<Wry>) -> Result<(), String> {
     let state = app_handle.state::<AppState>();
     let is_recording = state.is_recording.clone(); // Clone the Arc to use in this function
 
@@ -646,14 +663,19 @@ fn record_audio(app_handle: tauri::AppHandle) -> Result<(), String> {
 }
 
 // Add this function right after transcribe_audio_with_data or replace that function
-async fn transcribe_audio_data(wav_data: &[u8], app_handle: &tauri::AppHandle) -> Result<String> {
+async fn transcribe_audio_data<R: Runtime>(
+    wav_data: &[u8],
+    app_handle: &AppHandle<R>,
+) -> Result<String> {
     let client = reqwest::Client::new();
-    
+
     // Get the API key from the secure store
     let api_key = get_api_key(app_handle)?;
-    
+
     if api_key.is_empty() {
-        return Err(anyhow!("OpenAI API key not set. Please add it to .env or environment variables."));
+        return Err(anyhow!(
+            "OpenAI API key not set. Please add it to .env or environment variables."
+        ));
     }
 
     let form = reqwest::multipart::Form::new().text("model", "whisper-1");
@@ -686,46 +708,132 @@ async fn transcribe_audio_data(wav_data: &[u8], app_handle: &tauri::AppHandle) -
     Ok(transcription.text)
 }
 
+// Define event IDs for menu items
+const TRAY_RECORD_AUDIO: &str = "tray-record-audio";
+const TRAY_SHOW_WINDOW: &str = "tray-show-window";
+const TRAY_HIDE_WINDOW: &str = "tray-hide-window";
+const TRAY_QUIT: &str = "tray-quit";
+const TRAY_SEPARATOR: &str = "tray-separator";
+
+// Create a function to set up the tray menu for Tauri v2
+fn create_tray_menu<R: Runtime>(app_handle: &AppHandle<R>) -> Menu<R> {
+    // Create menu items - note we pass app_handle to build()
+    let record = MenuItemBuilder::with_id(TRAY_RECORD_AUDIO, "Record Audio")
+        .build(app_handle)
+        .unwrap();
+    let show = MenuItemBuilder::with_id(TRAY_SHOW_WINDOW, "Show Window")
+        .build(app_handle)
+        .unwrap();
+    let hide = MenuItemBuilder::with_id(TRAY_HIDE_WINDOW, "Hide Window")
+        .build(app_handle)
+        .unwrap();
+
+    // Create a separator - in v2 we use a MenuItemBuilder with an empty label
+    let separator = MenuItemBuilder::with_id(TRAY_SEPARATOR, "")
+        .build(app_handle)
+        .unwrap();
+
+    let quit = MenuItemBuilder::with_id(TRAY_QUIT, "Quit")
+        .build(app_handle)
+        .unwrap();
+
+    // Fixed: Pass app_handle as first argument and borrow the array
+    Menu::with_items(app_handle, &[&record, &show, &hide, &separator, &quit]).unwrap()
+}
+
+// Set up the tray icon
+fn setup_system_tray(app_handle: &AppHandle<Wry>) -> Result<(), Box<dyn std::error::Error>> {
+    // Create the tray menu
+    let tray_menu = create_tray_menu(app_handle);
+
+    // Build the tray icon
+    TrayIconBuilder::new()
+        .menu(&tray_menu)
+        .icon_as_template(true)
+        .build(app_handle)?;
+
+    // Set up the menu event handler using on_menu_event
+    app_handle.on_menu_event(move |app, event| {
+        handle_tray_event(app, event);
+    });
+
+    Ok(())
+}
+
+// Handle menu events
+fn handle_tray_event(app: &AppHandle<Wry>, event: MenuEvent) {
+    match event.id.as_ref() {
+        TRAY_QUIT => {
+            std::process::exit(0);
+        }
+        TRAY_RECORD_AUDIO => {
+            // Call the record function
+            if let Err(e) = record_audio(app.clone()) {
+                eprintln!("Error starting recording from tray: {}", e);
+            }
+        }
+        TRAY_SHOW_WINDOW => {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }
+        TRAY_HIDE_WINDOW => {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.hide();
+            }
+        }
+        _ => {}
+    }
+}
+
 // Fix the setup function in run() to handle the Result from store()
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     // Fixed shortcuts
     let fixed_toggle_shortcut = "super+KeyG".to_string();
     let fixed_hold_shortcut = "super+KeyK".to_string();
-    
+
     let app = tauri::Builder::default()
         .plugin(http_init())
         .plugin(shell_init())
         .plugin(opener_init())
-        .plugin(tauri_plugin_store::Builder::default().build())  // Add store plugin
+        .plugin(tauri_plugin_store::Builder::default().build()) // Add store plugin
         .setup(move |app| {
             #[cfg(desktop)]
             {
                 let app_handle = app.handle();
-                
-                // Initialize the store and preload the API key - handle the Result
+
+                // Initialize the store and preload the API key
                 if let Ok(_store) = app_handle.store("api_keys.dat") {
                     println!("Store initialized successfully");
                 } else {
                     println!("Failed to initialize store, will use only env file");
                 }
-                
+
                 // Try to get API key from environment or .env
                 if let Ok(api_key) = get_api_key(&app_handle) {
                     if !api_key.is_empty() {
                         println!("API key initialized successfully");
                     } else {
-                        println!("No API key found. Please add it to the environment or .env file.");
+                        println!(
+                            "No API key found. Please add it to the environment or .env file."
+                        );
                     }
                 }
-                
+
+                // Set up system tray
+                if let Err(e) = setup_system_tray(&app_handle) {
+                    eprintln!("Failed to set up system tray: {}", e);
+                }
+
                 app.manage(AppState {
                     _shortcut: Arc::new(Mutex::new(fixed_toggle_shortcut.clone())),
                     _hold_shortcut: Arc::new(Mutex::new(fixed_hold_shortcut.clone())),
                     is_recording: Arc::new(AtomicBool::new(false)),
                     last_trigger: Arc::new(Mutex::new(None)),
                 });
-                
+
                 let handle_clone = app_handle.clone();
                 app_handle.plugin(
                     tauri_plugin_global_shortcut::Builder::new()
@@ -734,8 +842,25 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                         })
                         .build(),
                 )?;
-                if let Err(e) = update_global_shortcut(&app_handle, &fixed_toggle_shortcut, &fixed_hold_shortcut) {
+                if let Err(e) = update_global_shortcut(
+                    &app_handle,
+                    &fixed_toggle_shortcut,
+                    &fixed_hold_shortcut,
+                ) {
                     eprintln!("Failed to register global shortcuts: {}", e);
+                }
+
+                // Configure window to hide instead of close
+                if let Some(window) = app_handle.get_webview_window("main") {
+                    // Use a new variable to avoid moving the window
+                    let window_clone = window.clone();
+                    window.on_window_event(move |event| {
+                        if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                            // Hide window instead of closing
+                            let _ = window_clone.hide();
+                            api.prevent_close();
+                        }
+                    });
                 }
             }
             Ok(())
@@ -746,7 +871,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             record_audio
         ])
         .build(tauri::generate_context!())?;
-        
+
     app.run(|_, _| {});
     Ok(())
 }
