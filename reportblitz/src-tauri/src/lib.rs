@@ -4,9 +4,9 @@ use anyhow::{anyhow, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::SampleFormat;
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::{fs, thread};
+use std::thread;
 use tauri::{Emitter, Manager};
 //use tokio::sync::mpsc;
 use std::env;
@@ -16,7 +16,6 @@ use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 use tauri_plugin_http::init as http_init;
 use tauri_plugin_opener::init as opener_init;
 use tauri_plugin_shell::init as shell_init;
-use tauri::Wry;
 use tauri_plugin_store::StoreExt;
 use serde_json::json;
 
@@ -134,35 +133,6 @@ fn update_shortcut_config(
         .map_err(|e| e.to_string())?;
     update_global_shortcut(&app_handle, &new_shortcut, "super+KeyK").map_err(|e| e.to_string())?;
     Ok(())
-}
-
-// Function to load API key from .env file
-fn load_api_key() -> Result<String> {
-    // First try to load from environment variable
-    if let Ok(key) = env::var("OPENAI_API_KEY") {
-        if !key.is_empty() {
-            return Ok(key);
-        }
-    }
-
-    // Then try to load from .env file
-    let env_path = get_env_file_path()?;
-    if env_path.exists() {
-        let file = File::open(env_path)?;
-        let reader = BufReader::new(file);
-
-        for line in reader.lines() {
-            let line = line?;
-            if line.starts_with("OPENAI_API_KEY=") {
-                let key = line.trim_start_matches("OPENAI_API_KEY=").to_string();
-                if !key.is_empty() {
-                    return Ok(key);
-                }
-            }
-        }
-    }
-
-    Ok(String::new())
 }
 
 // Function to get the path to the .env file in the Resources directory
@@ -317,24 +287,12 @@ fn handle_shortcut(app_handle: &tauri::AppHandle, shortcut: &Shortcut, state: Sh
     }
 }
 
-// Function to get the temp directory for storing audio files
-fn get_temp_dir() -> Result<PathBuf> {
-    let temp_dir = std::env::temp_dir().join("reportblitz");
-
-    if !temp_dir.exists() {
-        fs::create_dir_all(&temp_dir)?;
-    }
-
-    Ok(temp_dir)
-}
-
-// Internal functio// Here's the fixed version for the audio callbacks, using a simple counter instead of thread ID
+// Optimized record_audio_internal function
 fn record_audio_internal(app_handle: tauri::AppHandle) -> Result<()> {
     let state = app_handle.state::<AppState>();
     let is_recording = state.is_recording.clone();
 
-    // This thread will handle audio recording and stream management
-    // but won't try to move the Stream between threads
+    // Create a single thread for audio processing
     thread::spawn(move || {
         // Set up runtime inside thread for async operations
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -351,37 +309,58 @@ fn record_audio_internal(app_handle: tauri::AppHandle) -> Result<()> {
                 }
             };
 
-            println!(
-                "Using input device: {}",
-                match device.name() {
-                    Ok(name) => name,
-                    Err(_) => "Unknown Device".to_string(),
-                }
-            );
-
-            // Get supported configs
-            let supported_configs = match device.supported_input_configs() {
-                Ok(configs) => configs,
-                Err(e) => {
-                    eprintln!("Error getting input configs: {}", e);
-                    let _ = app_handle.emit("error", format!("Microphone error: {}", e));
-                    return;
-                }
-            };
-
-            println!("Available input configurations:");
-            for config in supported_configs {
-                println!("  {:?}", config);
-            }
-
-            // Select a configuration
+            // For optimization, we'll use a fixed configuration that's good enough for speech
+            // instead of always using the maximum sample rate
+            let target_sample_rate = 24000; // 16kHz is sufficient for speech recognition
+            
+            // Find a suitable configuration with reasonable sample rate
             let supported_config = match device.supported_input_configs() {
                 Ok(configs) => {
-                    match configs
-                        .filter(|c| c.channels() == 1)
-                        .max_by_key(|c| c.max_sample_rate().0)
-                    {
-                        Some(config) => config.with_max_sample_rate(),
+                    let mut best_config = None;
+                    
+                    for config_range in configs.filter(|c| c.channels() == 1) {
+                        let min_rate = config_range.min_sample_rate().0;
+                        let max_rate = config_range.max_sample_rate().0;
+                        
+                        // Select the config that can support our target rate
+                        if min_rate <= target_sample_rate && max_rate >= target_sample_rate {
+                            best_config = Some(config_range.with_sample_rate(cpal::SampleRate(target_sample_rate)));
+                            break;
+                        }
+                    }
+                    
+                    // If we didn't find a config that supports our exact target,
+                    // just choose one with the closest sample rate
+                    if best_config.is_none() {
+                        best_config = match device.supported_input_configs() {
+                            Ok(configs) => {
+                                configs
+                                    .filter(|c| c.channels() == 1)
+                                    .min_by_key(|c| {
+                                        let rate = if c.max_sample_rate().0 < target_sample_rate {
+                                            c.max_sample_rate().0
+                                        } else {
+                                            c.min_sample_rate().0
+                                        };
+                                        (target_sample_rate as i32 - rate as i32).abs()
+                                    })
+                                    .map(|c| {
+                                        // Choose the closest available sample rate
+                                        if c.min_sample_rate().0 > target_sample_rate {
+                                            c.with_sample_rate(c.min_sample_rate())
+                                        } else if c.max_sample_rate().0 < target_sample_rate {
+                                            c.with_sample_rate(c.max_sample_rate())
+                                        } else {
+                                            c.with_sample_rate(cpal::SampleRate(target_sample_rate))
+                                        }
+                                    })
+                            }
+                            Err(_) => None,
+                        };
+                    }
+                    
+                    match best_config {
+                        Some(config) => config,
                         None => {
                             eprintln!("No suitable input config found");
                             let _ = app_handle.emit("error", "Microphone configuration error");
@@ -402,45 +381,53 @@ fn record_audio_internal(app_handle: tauri::AppHandle) -> Result<()> {
             let sample_format = supported_config.sample_format();
             let sample_rate = config.sample_rate.0;
 
-            // Create a buffer to collect samples, staying in this thread
-            let all_samples: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
+            // Use a more efficient buffer approach to reduce mutex contention
+            // Pre-allocate with a reasonable size based on typical recording duration
+            let capacity = sample_rate as usize * 60; // 1 minute of audio at our sample rate
+            let all_samples: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::with_capacity(capacity)));
             let all_samples_clone = all_samples.clone();
 
-            // Create a counter for throttling log messages
-            let callback_counter = Arc::new(Mutex::new(0));
-
+            // Create batching for samples to reduce mutex contention
+            let batch_size = sample_rate as usize / 4; // 0.25 seconds worth of samples
+            
             // Error callback
             let err_fn = |err| {
                 eprintln!("Stream error: {:?}", err);
             };
+
+            // Only log once every 2 seconds
+            let log_interval = std::time::Duration::from_secs(2);
+            let _last_log = std::time::Instant::now();
 
             // Create and start the stream based on sample format
             let stream = match sample_format {
                 SampleFormat::F32 => {
                     let samples = all_samples.clone();
                     let is_rec = is_recording.clone();
-                    let counter = callback_counter.clone();
+                    let mut batch: Vec<f32> = Vec::with_capacity(batch_size);
+                    let last_log_time = Arc::new(Mutex::new(std::time::Instant::now()));
+                    
                     let callback = move |data: &[f32], _: &_| {
                         if is_rec.load(Ordering::SeqCst) {
-                            // Throttle logging - only log every 100 callbacks
-                            let should_log = {
-                                let mut count = counter.lock().unwrap();
-                                *count += 1;
-                                if *count >= 100 {
-                                    *count = 0;
-                                    true
-                                } else {
-                                    false
-                                }
-                            };
-
-                            if should_log && !data.is_empty() {
-                                println!("Audio F32 callback: {} samples", data.len());
-                            }
-
                             if !data.is_empty() {
-                                let mut buffer = samples.lock().unwrap();
-                                buffer.extend_from_slice(data);
+                                // Collect samples to batch before locking mutex
+                                batch.extend_from_slice(data);
+                                
+                                // Only lock the mutex and push when we have a full batch
+                                if batch.len() >= batch_size {
+                                    let now = std::time::Instant::now();
+                                    let mut last_log = last_log_time.lock().unwrap();
+                                    if now.duration_since(*last_log) >= log_interval {
+                                        println!("Audio batch collected: {} samples", batch.len());
+                                        *last_log = now;
+                                    }
+                                    
+                                    let mut buffer = samples.lock().unwrap();
+                                    buffer.append(&mut batch);
+                                    
+                                    // Reset the batch with the same capacity
+                                    batch = Vec::with_capacity(batch_size);
+                                }
                             }
                         }
                     };
@@ -457,30 +444,30 @@ fn record_audio_internal(app_handle: tauri::AppHandle) -> Result<()> {
                 SampleFormat::I16 => {
                     let samples = all_samples.clone();
                     let is_rec = is_recording.clone();
-                    let counter = callback_counter.clone();
+                    let mut batch: Vec<f32> = Vec::with_capacity(batch_size);
+                    let last_log_time = Arc::new(Mutex::new(std::time::Instant::now()));
+                    
                     let callback = move |data: &[i16], _: &_| {
                         if is_rec.load(Ordering::SeqCst) {
-                            // Throttle logging - only log every 100 callbacks
-                            let should_log = {
-                                let mut count = counter.lock().unwrap();
-                                *count += 1;
-                                if *count >= 100 {
-                                    *count = 0;
-                                    true
-                                } else {
-                                    false
-                                }
-                            };
-
-                            if should_log && !data.is_empty() {
-                                println!("Audio I16 callback: {} samples", data.len());
-                            }
-
                             if !data.is_empty() {
-                                let data_vec: Vec<f32> =
-                                    data.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
-                                let mut buffer = samples.lock().unwrap();
-                                buffer.extend(data_vec);
+                                // Convert and collect samples in batch
+                                batch.extend(data.iter().map(|&s| s as f32 / i16::MAX as f32));
+                                
+                                // Only lock the mutex when batch is full
+                                if batch.len() >= batch_size {
+                                    let now = std::time::Instant::now();
+                                    let mut last_log = last_log_time.lock().unwrap();
+                                    if now.duration_since(*last_log) >= log_interval {
+                                        println!("Audio batch collected: {} samples", batch.len());
+                                        *last_log = now;
+                                    }
+                                    
+                                    let mut buffer = samples.lock().unwrap();
+                                    buffer.append(&mut batch);
+                                    
+                                    // Reset the batch
+                                    batch = Vec::with_capacity(batch_size);
+                                }
                             }
                         }
                     };
@@ -497,32 +484,31 @@ fn record_audio_internal(app_handle: tauri::AppHandle) -> Result<()> {
                 SampleFormat::U16 => {
                     let samples = all_samples.clone();
                     let is_rec = is_recording.clone();
-                    let counter = callback_counter.clone();
+                    let mut batch: Vec<f32> = Vec::with_capacity(batch_size);
+                    let last_log_time = Arc::new(Mutex::new(std::time::Instant::now()));
+                    
                     let callback = move |data: &[u16], _: &_| {
                         if is_rec.load(Ordering::SeqCst) {
-                            // Throttle logging - only log every 100 callbacks
-                            let should_log = {
-                                let mut count = counter.lock().unwrap();
-                                *count += 1;
-                                if *count >= 100 {
-                                    *count = 0;
-                                    true
-                                } else {
-                                    false
-                                }
-                            };
-
-                            if should_log && !data.is_empty() {
-                                println!("Audio U16 callback: {} samples", data.len());
-                            }
-
                             if !data.is_empty() {
-                                let data_vec: Vec<f32> = data
-                                    .iter()
-                                    .map(|&s| (s as f32 / u16::MAX as f32) * 2.0 - 1.0)
-                                    .collect();
-                                let mut buffer = samples.lock().unwrap();
-                                buffer.extend(data_vec);
+                                // Convert and collect samples in batch
+                                batch.extend(data.iter()
+                                    .map(|&s| (s as f32 / u16::MAX as f32) * 2.0 - 1.0));
+                                
+                                // Only lock the mutex when batch is full
+                                if batch.len() >= batch_size {
+                                    let now = std::time::Instant::now();
+                                    let mut last_log = last_log_time.lock().unwrap();
+                                    if now.duration_since(*last_log) >= log_interval {
+                                        println!("Audio batch collected: {} samples", batch.len());
+                                        *last_log = now;
+                                    }
+                                    
+                                    let mut buffer = samples.lock().unwrap();
+                                    buffer.append(&mut batch);
+                                    
+                                    // Reset the batch
+                                    batch = Vec::with_capacity(batch_size);
+                                }
                             }
                         }
                     };
@@ -553,7 +539,6 @@ fn record_audio_internal(app_handle: tauri::AppHandle) -> Result<()> {
             println!("Audio processing thread started");
 
             // Loop until recording is stopped
-            // IMPORTANT: Keep checking is_recording while the stream is active
             while is_recording.load(Ordering::SeqCst) {
                 thread::sleep(std::time::Duration::from_millis(100));
             }
@@ -568,38 +553,56 @@ fn record_audio_internal(app_handle: tauri::AppHandle) -> Result<()> {
 
             println!("Total samples collected: {}", samples.len());
 
-            // Stream will be dropped when it goes out of scope at the end of this block
-            // We don't need to explicitly drop it
-
             if samples.is_empty() {
                 println!("No samples were collected, skipping file write and transcription.");
                 return;
             }
 
-            // The important part: We're staying in the same thread, so we can
-            // directly process the samples without thread safety issues
+            // Memory-based WAV creation
+            let spec = hound::WavSpec {
+                channels: 1,
+                sample_rate,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            };
 
-            let temp_dir = match get_temp_dir() {
-                Ok(dir) => dir,
+            // Create WAV file in memory
+            let mut cursor = std::io::Cursor::new(Vec::new());
+            let mut writer = match hound::WavWriter::new(&mut cursor, spec) {
+                Ok(writer) => writer,
                 Err(e) => {
-                    eprintln!("Failed to get temp dir: {}", e);
+                    eprintln!("Error creating WAV writer: {}", e);
                     return;
                 }
             };
 
-            let wav_path = temp_dir.join("recording.wav");
+            // Write samples to memory buffer
+            for &sample in &samples {
+                if let Err(e) = writer.write_sample((sample * i16::MAX as f32) as i16) {
+                    eprintln!("Error writing sample: {}", e);
+                    return;
+                }
+            }
 
-            if let Err(e) = write_wav_file(&wav_path, &samples, sample_rate) {
-                eprintln!("Error writing WAV file: {}", e);
+            // Finalize the WAV data in memory - STORE THE RESULT OF FINALIZE
+            let finalize_result = writer.finalize();
+            if let Err(e) = finalize_result {
+                eprintln!("Error finalizing WAV writer: {}", e);
                 return;
             }
 
-            println!("WAV file written successfully to {:?}", wav_path);
-            match transcribe_audio(&wav_path, &app_handle).await {
+            // Get the WAV data
+            let wav_data = cursor.into_inner();
+            println!("WAV data created in memory, size: {} bytes", wav_data.len());
+
+            // Free up memory we don't need anymore
+            drop(samples);
+
+            // Use the in-memory data for transcription directly
+            match transcribe_audio_data(&wav_data, &app_handle).await {
                 Ok(text) => {
                     println!("Transcription succeeded: {}", text);
                     let _ = app_handle.emit("transcription", text);
-                    let _ = fs::remove_file(&wav_path);
                 }
                 Err(e) => {
                     eprintln!("Transcription error: {}", e);
@@ -642,27 +645,8 @@ fn record_audio(app_handle: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-// Function to write a WAV file
-fn write_wav_file(path: &Path, samples: &[f32], sample_rate: u32) -> Result<()> {
-    let spec = hound::WavSpec {
-        channels: 1,
-        sample_rate,
-        bits_per_sample: 16,
-        sample_format: hound::SampleFormat::Int,
-    };
-
-    let mut writer = hound::WavWriter::create(path, spec)?;
-
-    for &sample in samples {
-        writer.write_sample((sample * i16::MAX as f32) as i16)?;
-    }
-
-    writer.finalize()?;
-    Ok(())
-}
-
-// Function to transcribe audio using OpenAI API
-async fn transcribe_audio(audio_path: &Path, app_handle: &tauri::AppHandle) -> Result<String> {
+// Add this function right after transcribe_audio_with_data or replace that function
+async fn transcribe_audio_data(wav_data: &[u8], app_handle: &tauri::AppHandle) -> Result<String> {
     let client = reqwest::Client::new();
     
     // Get the API key from the secure store
@@ -674,23 +658,18 @@ async fn transcribe_audio(audio_path: &Path, app_handle: &tauri::AppHandle) -> R
 
     let form = reqwest::multipart::Form::new().text("model", "whisper-1");
 
-    // Create a file part
-    let file_data = tokio::fs::read(audio_path).await?;
-    let file_part = reqwest::multipart::Part::bytes(file_data)
-        .file_name(
-            audio_path
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .to_string(),
-        )
+    // Create a file part from the memory buffer
+    let file_part = reqwest::multipart::Part::bytes(wav_data.to_vec())
+        .file_name("recording.wav")
         .mime_str("audio/wav")?;
 
     let form = form.part("file", file_part);
 
+    // Set a reasonable timeout for the request
     let response = client
         .post("https://api.openai.com/v1/audio/transcriptions")
         .header("Authorization", format!("Bearer {}", api_key))
+        .timeout(std::time::Duration::from_secs(30)) // 30 second timeout
         .multipart(form)
         .send()
         .await?;
@@ -725,7 +704,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let app_handle = app.handle();
                 
                 // Initialize the store and preload the API key - handle the Result
-                if let Ok(store) = app_handle.store("api_keys.dat") {
+                if let Ok(_store) = app_handle.store("api_keys.dat") {
                     println!("Store initialized successfully");
                 } else {
                     println!("Failed to initialize store, will use only env file");
