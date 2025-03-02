@@ -347,36 +347,15 @@
     <button type="submit">Save Configuration</button>
   </form>
 
-  {#if errorMessage}
-    <div class="error">{errorMessage}</div>
+  <!-- {#if errorMessage} -->
+  {#if false}
+     <div class="error">{errorMessage}</div>
   {/if}
 
   {#if successMessage}
     <div class="success">{successMessage}</div>
   {/if}
 
-  <div class="transcriptions-container">
-    <div class="transcriptions-header">
-      <h2>Transcriptions</h2>
-      <div class="transcriptions-actions">
-        <button on:click={clearTranscriptions} disabled={transcriptions.length === 0}>Clear</button>
-        <button on:click={copyToClipboard} disabled={transcriptions.length === 0}>Copy All</button>
-      </div>
-    </div>
-
-    <div class="transcriptions-list">
-      {#if transcriptions.length === 0}
-        <p class="empty-state">No transcriptions yet. Start recording to see them here.</p>
-      {:else}
-        {#each transcriptions as transcription, i}
-          <div class="transcription-item">
-            <span class="transcription-number">{i + 1}.</span>
-            <p>{transcription}</p>
-          </div>
-        {/each}
-      {/if}
-    </div>
-  </div>
 </main>
 
 <style>

@@ -1079,9 +1079,20 @@ fn is_likely_text_field() -> bool {
 // Add a function to load shortcuts from storage
 fn load_shortcuts_from_storage<R: Runtime>(app_handle: &AppHandle<R>) -> (String, String, String) {
     // Default shortcuts
+    #[cfg(target_os = "windows")]
+    let default_toggle = "ctrl+KeyG".to_string();
+    #[cfg(not(target_os = "windows"))]
     let default_toggle = "super+KeyG".to_string();
+
+    #[cfg(target_os = "windows")]
+    let default_hold = "ctrl+KeyK".to_string();
+    #[cfg(not(target_os = "windows"))]
     let default_hold = "super+KeyK".to_string();
-    let default_cancel = "super+KeyC".to_string(); // Default cancel shortcut
+
+    #[cfg(target_os = "windows")]
+    let default_cancel = "ctrl+KeyC".to_string();
+    #[cfg(not(target_os = "windows"))]
+    let default_cancel = "super+KeyC".to_string();
     
     // Try to get from store
     match app_handle.store("settings.dat") {
