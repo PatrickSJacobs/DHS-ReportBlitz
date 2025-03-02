@@ -3,74 +3,90 @@
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from '@tauri-apps/api/event';
 
-  // State variables
+  interface ShortcutConfig {
+    _shortcut: string;
+    _hold_shortcut: string;
+    api_key: string;
+  }
+
   let shortcut = $state("");
+  let holdShortcut = $state("");
   let apiKey = $state("");
   let isRecording = $state(false);
   let transcriptions = $state<string[]>([]);
   let errorMessage = $state("");
   let successMessage = $state("");
 
-  // Event listeners
   let unlistenRecordingStatus: (() => void) | null = null;
   let unlistenTranscription: (() => void) | null = null;
+  let unlistenError: (() => void) | null = null;
+
+  let shortcutConfig = {
+    _shortcut: "CommandOrControl+G",
+    _hold_shortcut: "CommandOrControl+K",
+    api_key: ""
+  };
 
   onMount(async () => {
-    // Get the current shortcut configuration
     try {
-      const config = await invoke("get_shortcut_config");
-      shortcut = config.shortcut;
-      apiKey = config.api_key;
+      shortcutConfig = await invoke("get_shortcut_config");
+      shortcut = shortcutConfig._shortcut || "CommandOrControl+G";
+      holdShortcut = shortcutConfig._hold_shortcut || "CommandOrControl+K";
+      console.log("Loaded shortcuts:", shortcut, holdShortcut);
     } catch (error) {
-      errorMessage = `Failed to load configuration: ${error}`;
+      console.error("Failed to get shortcut config:", error);
     }
 
-    // Listen for recording status changes
     unlistenRecordingStatus = await listen("recording-status", (event) => {
+      console.log("Recording status changed:", event.payload);
       isRecording = event.payload as boolean;
     });
 
-    // Listen for transcription events
     unlistenTranscription = await listen("transcription", (event) => {
+      console.log("Transcription received:", event.payload);
       const text = event.payload as string;
       if (text.trim()) {
         transcriptions = [...transcriptions, text];
       }
     });
+
+    // Add listener for error events
+    unlistenError = await listen("error", (event) => {
+      console.error("Error received:", event.payload);
+      errorMessage = event.payload as string;
+    });
+
+    console.log("Event listeners set up");
   });
 
   onDestroy(() => {
-    // Clean up event listeners
     if (unlistenRecordingStatus) unlistenRecordingStatus();
     if (unlistenTranscription) unlistenTranscription();
+    if (unlistenError) unlistenError();
   });
 
-  // Save the shortcut configuration
-  async function saveConfig(event: Event) {
-    event.preventDefault();
+  async function saveConfig(event?: Event) {
+    if (event) event.preventDefault();
     errorMessage = "";
     successMessage = "";
 
     try {
-      await invoke("update_shortcut_config", { shortcut, apiKey });
-      successMessage = "Configuration saved successfully!";
+      await invoke("update_shortcut_config", { shortcut });
+      successMessage = "Shortcut saved successfully!";
       setTimeout(() => {
         successMessage = "";
       }, 3000);
     } catch (error) {
-      errorMessage = `Failed to save configuration: ${error}`;
+      errorMessage = `Failed to save shortcut: ${error}`;
     }
   }
 
-  // Clear transcriptions
   function clearTranscriptions() {
     transcriptions = [];
   }
 
-  // Copy all transcriptions to clipboard
   function copyToClipboard() {
     if (transcriptions.length === 0) return;
-    
     const text = transcriptions.join("\n\n");
     navigator.clipboard.writeText(text).then(() => {
       successMessage = "Transcriptions copied to clipboard!";
@@ -85,13 +101,21 @@
 
 <main>
   <h1>ReportBlitz</h1>
-  <p class="description">Press {shortcut} to start/stop recording</p>
-
-  <div class="status-indicator" class:recording={isRecording}>
-    {isRecording ? 'Recording...' : 'Ready'}
+  <div class="shortcuts-info">
+    <p class="description">Press <kbd>Command+G</kbd> to toggle recording on/off</p>
+    <p class="description">Hold <kbd>Command+K</kbd> to record while pressed</p>
   </div>
 
-  <form on:submit={saveConfig}>
+  <div class="status-indicator" class:recording={isRecording}>
+    {#if isRecording}
+      <div class="recording-icon"></div>
+      Recording...
+    {:else}
+      Ready
+    {/if}
+  </div>
+
+  <form onsubmit={(e) => { e.preventDefault(); saveConfig(); }}>
     <div class="form-group">
       <label for="shortcut">Keyboard Shortcut:</label>
       <input 
@@ -99,21 +123,12 @@
         type="text" 
         bind:value={shortcut} 
         placeholder="e.g., CommandOrControl+G"
+        disabled
       />
-      <small>Use format like CommandOrControl+G, Alt+R, etc.</small>
+      <small>Currently fixed to Command+G (Mac) or Control+G (Windows/Linux)</small>
     </div>
 
-    <div class="form-group">
-      <label for="api-key">OpenAI API Key:</label>
-      <input 
-        id="api-key" 
-        type="password" 
-        bind:value={apiKey} 
-        placeholder="sk-..."
-      />
-    </div>
-
-    <button type="submit">Save Configuration</button>
+    <button type="submit" disabled>Save Configuration</button>
   </form>
 
   {#if errorMessage}
@@ -128,8 +143,8 @@
     <div class="transcriptions-header">
       <h2>Transcriptions</h2>
       <div class="transcriptions-actions">
-        <button on:click={clearTranscriptions} disabled={transcriptions.length === 0}>Clear</button>
-        <button on:click={copyToClipboard} disabled={transcriptions.length === 0}>Copy All</button>
+        <button onclick={clearTranscriptions} disabled={transcriptions.length === 0}>Clear</button>
+        <button onclick={copyToClipboard} disabled={transcriptions.length === 0}>Copy All</button>
       </div>
     </div>
 
@@ -162,20 +177,28 @@
     text-align: center;
   }
 
-  .description {
+  .shortcuts-info {
     text-align: center;
     margin-bottom: 1rem;
+  }
+
+  .shortcuts-info p {
+    margin: 0.5rem 0;
     font-size: 0.9rem;
     color: #666;
   }
 
   .status-indicator {
     text-align: center;
-    padding: 0.5rem;
+    padding: 0.75rem;
     margin-bottom: 1rem;
     background-color: #eee;
     border-radius: 4px;
     font-weight: bold;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
   }
 
   .status-indicator.recording {
@@ -187,6 +210,20 @@
   @keyframes pulse {
     0% { opacity: 1; }
     50% { opacity: 0.7; }
+    100% { opacity: 1; }
+  }
+
+  .recording-icon {
+    width: 12px;
+    height: 12px;
+    background-color: #fff;
+    border-radius: 50%;
+    animation: blink 1s infinite;
+  }
+
+  @keyframes blink {
+    0% { opacity: 1; }
+    50% { opacity: 0.3; }
     100% { opacity: 1; }
   }
 
@@ -319,8 +356,23 @@
     flex: 1;
   }
 
+  kbd {
+    background-color: #f7f7f7;
+    border: 1px solid #ccc;
+    border-radius: 3px;
+    box-shadow: 0 1px 0 rgba(0,0,0,0.2);
+    color: #333;
+    display: inline-block;
+    font-family: monospace;
+    font-size: 0.85em;
+    font-weight: 700;
+    line-height: 1;
+    padding: 2px 4px;
+    white-space: nowrap;
+  }
+
   @media (prefers-color-scheme: dark) {
-    body {
+    :global(body) {
       background-color: #1e1e1e;
       color: #f0f0f0;
     }
@@ -344,12 +396,23 @@
       border-bottom-color: #333;
     }
 
-    .description, small {
+    .shortcuts-info p, small {
       color: #aaa;
     }
 
     .empty-state {
       color: #777;
+    }
+
+    kbd {
+      background-color: #333;
+      border-color: #555;
+      box-shadow: 0 1px 0 rgba(255,255,255,0.1);
+      color: #f0f0f0;
+    }
+
+    .recording-icon {
+      background-color: #fff;
     }
   }
 </style>

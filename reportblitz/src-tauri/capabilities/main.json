@@ -2,12 +2,15 @@
   "$schema": "https://github.com/tauri-apps/tauri/blob/dev/tooling/cli/schema.json",
   "identifier": "main-capability",
   "description": "Capability for the main window",
-  "windows": ["main"],
+  "windows": [
+    "main"
+  ],
   "permissions": [
     "global-shortcut:default",
     "core:event:default",
     "core:path:default",
     "http:default",
-    "core:app:default"
+    "core:app:default",
+    "store:default"
   ]
-} 
+}
