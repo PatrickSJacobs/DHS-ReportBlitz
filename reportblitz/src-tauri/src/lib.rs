@@ -23,6 +23,8 @@ use tauri::menu::{Menu, MenuEvent, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
 use tauri::Wry;
 use tauri::{AppHandle, Runtime};
+use enigo::{Enigo, KeyboardControllable};
+use std::time::{Duration, Instant};
 
 // App state structure
 use std::sync::atomic::AtomicBool;
@@ -30,8 +32,42 @@ use std::sync::atomic::AtomicBool;
 pub struct AppState {
     _shortcut: Arc<Mutex<String>>,
     _hold_shortcut: Arc<Mutex<String>>,
+    _cancel_shortcut: Arc<Mutex<String>>, // New field for cancel shortcut
     is_recording: Arc<AtomicBool>,
+    is_cancelled: Arc<AtomicBool>, // Track if recording was cancelled
     last_trigger: Arc<Mutex<Option<(String, Instant)>>>,
+    strict_text_field_mode: Arc<AtomicBool>,
+}
+
+#[tauri::command]
+fn toggle_strict_text_field_mode(
+    app_handle: AppHandle<Wry>,
+    state: tauri::State<'_, AppState>,
+) -> Result<bool, String> {
+    let current = state.strict_text_field_mode.load(Ordering::SeqCst);
+    let new_value = !current;
+    state.strict_text_field_mode.store(new_value, Ordering::SeqCst);
+    
+    // Save the setting
+    let store = match app_handle.store("settings.dat") {
+        Ok(store) => store,
+        Err(e) => return Err(format!("Failed to access settings store: {}", e)),
+    };
+    
+    store.set("strict_text_field_mode", json!(new_value));
+    if let Err(e) = store.save() {
+        return Err(format!("Failed to save settings: {}", e));
+    }
+    
+    Ok(new_value)
+}
+
+// Add this command to get the current mode
+#[tauri::command]
+fn get_strict_text_field_mode(
+    state: tauri::State<'_, AppState>,
+) -> bool {
+    state.strict_text_field_mode.load(Ordering::SeqCst)
 }
 
 // Function to get the API key from the secure store
@@ -106,6 +142,7 @@ fn get_api_key<R: Runtime>(app_handle: &AppHandle<R>) -> Result<String> {
 struct ShortcutConfig {
     _shortcut: String,
     _hold_shortcut: String,
+    _cancel_shortcut: String,
     api_key: String,
 }
 
@@ -120,6 +157,7 @@ fn get_shortcut_config(state: tauri::State<'_, AppState>) -> ShortcutConfig {
     ShortcutConfig {
         _shortcut: state._shortcut.lock().unwrap().clone(),
         _hold_shortcut: state._hold_shortcut.lock().unwrap().clone(),
+        _cancel_shortcut: state._cancel_shortcut.lock().unwrap().clone(),
         api_key: "".to_string(), // Don't expose API key to frontend
     }
 }
@@ -127,16 +165,54 @@ fn get_shortcut_config(state: tauri::State<'_, AppState>) -> ShortcutConfig {
 // Command to update the shortcut configuration
 #[tauri::command]
 fn update_shortcut_config(
-    _shortcut: String,
+    toggle_shortcut: String,
+    hold_shortcut: String,
+    cancel_shortcut: String,
     app_handle: AppHandle<Wry>,
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
-    let new_shortcut = "super+KeyG".to_string();
-    *state._shortcut.lock().unwrap() = new_shortcut.clone();
+    // Validate shortcuts
+    if toggle_shortcut.is_empty() || hold_shortcut.is_empty() || cancel_shortcut.is_empty() {
+        return Err("Shortcuts cannot be empty".to_string());
+    }
+    
+    // Check for conflicts
+    if toggle_shortcut == hold_shortcut || toggle_shortcut == cancel_shortcut || hold_shortcut == cancel_shortcut {
+        return Err("All shortcuts must be different".to_string());
+    }
+    
+    // Update the state
+    *state._shortcut.lock().unwrap() = toggle_shortcut.clone();
+    *state._hold_shortcut.lock().unwrap() = hold_shortcut.clone();
+    *state._cancel_shortcut.lock().unwrap() = cancel_shortcut.clone();
+    
+    // Save to persistent storage
+    let store = match app_handle.store("settings.dat") {
+        Ok(store) => store,
+        Err(e) => return Err(format!("Failed to access settings store: {}", e)),
+    };
+    
+    store.set("toggle_shortcut", json!(toggle_shortcut));
+    store.set("hold_shortcut", json!(hold_shortcut));
+    store.set("cancel_shortcut", json!(cancel_shortcut));
+    
+    if let Err(e) = store.save() {
+        return Err(format!("Failed to save settings: {}", e));
+    }
+    
+    // Update global shortcuts
+    update_global_shortcut(&app_handle, &toggle_shortcut, &hold_shortcut, &cancel_shortcut)
+        .map_err(|e| format!("Failed to register shortcuts: {}", e))?;
+    
+    // Emit an event to inform frontend
     app_handle
-        .emit("shortcut-updated", &new_shortcut)
+        .emit("shortcuts-updated", json!({
+            "toggle_shortcut": toggle_shortcut,
+            "hold_shortcut": hold_shortcut,
+            "cancel_shortcut": cancel_shortcut
+        }))
         .map_err(|e| e.to_string())?;
-    update_global_shortcut(&app_handle, &new_shortcut, "super+KeyK").map_err(|e| e.to_string())?;
+    
     Ok(())
 }
 
@@ -196,23 +272,21 @@ fn update_global_shortcut<R: Runtime>(
     app_handle: &AppHandle<R>,
     toggle_shortcut: &str,
     hold_shortcut: &str,
+    cancel_shortcut: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!(
-        "Attempting to register shortcuts: toggle={}, hold={}",
-        toggle_shortcut, hold_shortcut
+        "Attempting to register shortcuts: toggle={}, hold={}, cancel={}",
+        toggle_shortcut, hold_shortcut, cancel_shortcut
     );
+    
     app_handle.global_shortcut().unregister_all()?;
     app_handle.global_shortcut().register(toggle_shortcut)?;
-    println!(
-        "Toggle shortcut {} registered successfully",
-        toggle_shortcut
-    );
     app_handle.global_shortcut().register(hold_shortcut)?;
-    println!("Hold shortcut {} registered successfully", hold_shortcut);
+    app_handle.global_shortcut().register(cancel_shortcut)?;
+    
+    println!("All shortcuts registered successfully");
     Ok(())
 }
-
-use std::time::{Duration, Instant};
 
 use std::sync::atomic::Ordering;
 
@@ -247,8 +321,24 @@ fn handle_shortcut<R: Runtime>(
 
     let toggle_shortcut = app_state._shortcut.lock().unwrap().clone();
     let hold_shortcut = app_state._hold_shortcut.lock().unwrap().clone();
+    let cancel_shortcut = app_state._cancel_shortcut.lock().unwrap().clone();
 
-    // For toggle shortcut, only respond to Pressed state (ignore Released)
+    // Handle cancel shortcut (only respond to Pressed state)
+    if shortcut_str == cancel_shortcut && state == ShortcutState::Pressed {
+        println!("Cancel shortcut triggered!");
+        
+        // If we're recording, cancel it
+        if app_state.is_recording.load(Ordering::SeqCst) {
+            println!("Cancelling current recording");
+            app_state.is_cancelled.store(true, Ordering::SeqCst); // Mark as cancelled
+            app_state.is_recording.store(false, Ordering::SeqCst); // Stop recording
+            let _ = app_handle.emit("recording-status", false);
+            let _ = app_handle.emit("recording-cancelled", true);
+        }
+        return;
+    }
+
+    // Original toggle shortcut handler
     if shortcut_str == toggle_shortcut && state == ShortcutState::Pressed {
         println!("Toggle shortcut matched!");
 
@@ -258,6 +348,9 @@ fn handle_shortcut<R: Runtime>(
             app_state.is_recording.store(false, Ordering::SeqCst);
             let _ = app_handle.emit("recording-status", false);
         } else {
+            // Reset cancelled state
+            app_state.is_cancelled.store(false, Ordering::SeqCst);
+            
             // If not recording, start
             println!("Not recording, starting");
             app_state.is_recording.store(true, Ordering::SeqCst);
@@ -271,12 +364,16 @@ fn handle_shortcut<R: Runtime>(
             });
         }
     } else if shortcut_str == hold_shortcut {
+        // Original hold shortcut handler
         println!("Hold shortcut matched! State: {:?}", state);
 
         if state == ShortcutState::Pressed {
             println!("Hold shortcut pressed");
             let is_recording = app_state.is_recording.load(Ordering::SeqCst);
             if !is_recording {
+                // Reset cancelled state
+                app_state.is_cancelled.store(false, Ordering::SeqCst);
+                
                 app_state.is_recording.store(true, Ordering::SeqCst);
                 let _ = app_handle.emit("recording-status", true);
                 println!("Recording started");
@@ -299,10 +396,12 @@ fn handle_shortcut<R: Runtime>(
     }
 }
 
+
 // Optimized record_audio_internal function
 fn record_audio_internal<R: Runtime>(app_handle: AppHandle<R>) -> Result<()> {
     let state = app_handle.state::<AppState>();
     let is_recording = state.is_recording.clone();
+    let is_cancelled = state.is_cancelled.clone();
 
     // Create a single thread for audio processing
     thread::spawn(move || {
@@ -557,7 +656,13 @@ fn record_audio_internal<R: Runtime>(app_handle: AppHandle<R>) -> Result<()> {
 
             // Loop until recording is stopped
             while is_recording.load(Ordering::SeqCst) {
-                thread::sleep(std::time::Duration::from_millis(100));
+                thread::sleep(std::time::Duration::from_millis(10));
+            }
+
+            // Check if recording was cancelled
+            if is_cancelled.load(Ordering::SeqCst) {
+                println!("Recording was cancelled, skipping transcription");
+                return;
             }
 
             println!("Recording stopped, processing samples...");
@@ -572,6 +677,12 @@ fn record_audio_internal<R: Runtime>(app_handle: AppHandle<R>) -> Result<()> {
 
             if samples.is_empty() {
                 println!("No samples were collected, skipping file write and transcription.");
+                return;
+            }
+
+            // Check again if recording was cancelled
+            if is_cancelled.load(Ordering::SeqCst) {
+                println!("Recording was cancelled, skipping transcription");
                 return;
             }
 
@@ -616,10 +727,20 @@ fn record_audio_internal<R: Runtime>(app_handle: AppHandle<R>) -> Result<()> {
             drop(samples);
 
             // Use the in-memory data for transcription directly
+            if is_cancelled.load(Ordering::SeqCst) {
+                println!("Recording was cancelled, skipping transcription");
+                return;
+            }
+            
             match transcribe_audio_data(&wav_data, &app_handle).await {
                 Ok(text) => {
-                    println!("Transcription succeeded: {}", text);
-                    let _ = app_handle.emit("transcription", text);
+                    // Skip typing if cancelled after transcription completed
+                    if !is_cancelled.load(Ordering::SeqCst) {
+                        println!("Transcription succeeded: {}", text);
+                        //let _ = app_handle.emit("transcription", text);
+                    } else {
+                        println!("Transcription completed but cancelled, not typing text");
+                    }
                 }
                 Err(e) => {
                     eprintln!("Transcription error: {}", e);
@@ -705,6 +826,24 @@ async fn transcribe_audio_data<R: Runtime>(
     }
 
     let transcription: TranscriptionResponse = response.json().await?;
+    
+    // Send the text to UI
+    let _ = app_handle.emit("transcription", &transcription.text);
+    
+    // Type the text at the cursor position
+    let text_to_type = transcription.text.clone();
+    let app_handle_clone = app_handle.clone();
+    thread::spawn(move || {
+        // Wait a moment before starting to type
+        thread::sleep(Duration::from_millis(0));
+        
+        if let Err(e) = type_text_at_cursor(&text_to_type, &app_handle_clone) {
+            eprintln!("Error typing text: {}", e);
+        } else {
+            println!("Successfully typed text at cursor");
+        }
+    });
+    
     Ok(transcription.text)
 }
 
@@ -787,18 +926,192 @@ fn handle_tray_event(app: &AppHandle<Wry>, event: MenuEvent) {
     }
 }
 
-// Fix the setup function in run() to handle the Result from store()
+
+fn type_text_at_cursor(text: &str, app_handle: &AppHandle<impl Runtime>) -> Result<()> {
+    // Get AppState to check if strict mode is enabled
+    let app_state = app_handle.state::<AppState>();
+    let strict_mode = app_state.strict_text_field_mode.load(Ordering::SeqCst);
+    
+    // If strict mode is enabled, try to detect if we're in a text field
+    if strict_mode && !is_likely_text_field() {
+        println!("Strict mode enabled and no text field detected, skipping text insertion");
+        
+        // Notify the user
+        let _ = app_handle.emit("text-field-detection", json!({
+            "detected": false,
+            "message": "No text field detected. Move your cursor to a text field and try again."
+        }));
+        
+        return Ok(());
+    }
+    
+    // Create a new Enigo instance for keyboard control
+    let mut enigo = Enigo::new();
+    
+    // Small delay to ensure the application is ready
+    //thread::sleep(Duration::from_millis(200));
+    
+    // Type the text character by character with a small delay between each
+    for character in text.chars() {
+        // Convert each character to a string before typing
+        enigo.key_sequence(&character.to_string());
+        
+        // Small delay to prevent overwhelming the target application
+        // Different systems might need different delays
+        thread::sleep(Duration::from_millis(0));
+    }
+    
+    Ok(())
+}
+
+fn is_likely_text_field() -> bool {
+    // Platform-specific detection when possible
+    #[cfg(target_os = "macos")]
+    {
+        // On macOS, try to use AppleScript for more accurate detection
+        if let Ok(output) = std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(r#"
+                tell application "System Events"
+                    set frontApp to name of first application process whose frontmost is true
+                    set frontAppPath to path of application file of first application process whose frontmost is true
+                    return frontApp & ":" & frontAppPath
+                end tell
+            "#)
+            .output()
+        {
+            let output_str = String::from_utf8_lossy(&output.stdout).to_lowercase();
+            
+            // Check for common text editors and applications
+            let common_text_apps = [
+                "textedit", "notes", "pages", "word", "sublime", 
+                "vscode", "visual studio code", "textmate", "terminal",
+                "iterm", "chrome", "safari", "firefox", "slack", "discord",
+                "outlook", "mail", "evernote", "notion", "google docs"
+            ];
+            
+            // Check if any of these apps are in the output
+            if common_text_apps.iter().any(|&app| output_str.contains(app)) {
+                return true;
+            }
+            
+            // If we get output but didn't match known apps, try one more check
+            // This attempts to determine if the focused element can accept text input
+            if let Ok(element_info) = std::process::Command::new("osascript")
+                .arg("-e")
+                .arg(r#"
+                    tell application "System Events"
+                        set focusedElement to focused object of first application process whose frontmost is true
+                        set elementRole to role of focusedElement
+                        return elementRole
+                    end tell
+                "#)
+                .output()
+            {
+                let element_role = String::from_utf8_lossy(&element_info.stdout).to_lowercase();
+                
+                // Common roles that can accept text
+                let text_roles = [
+                    "text field", "text area", "editor", "document", "sheet",
+                    "textfield", "textarea"
+                ];
+                
+                if text_roles.iter().any(|&role| element_role.contains(role)) {
+                    return true;
+                }
+            }
+        }
+    }
+    
+    #[cfg(target_os = "windows")]
+    {
+        // On Windows, we could use the Windows API to check the focused control
+        // This is a simplified version - in a full implementation you'd use winapi
+        // to call GetForegroundWindow and related APIs
+        
+        // For now, we'll use a basic approach with PowerShell
+        if let Ok(output) = std::process::Command::new("powershell")
+            .arg("-Command")
+            .arg("Get-Process | Where-Object {$_.MainWindowHandle -ne 0 -and $_.MainWindowTitle -ne ''} | Select-Object -First 1 | Select-Object -ExpandProperty ProcessName")
+            .output()
+        {
+            let app_name = String::from_utf8_lossy(&output.stdout).to_lowercase();
+            let common_text_apps = [
+                "notepad", "word", "excel", "outlook", "code", "sublime_text",
+                "chrome", "firefox", "edge", "teams", "slack", "discord",
+                "powershell", "cmd", "windowsterminal", "putty", "terminal"
+            ];
+            
+            if common_text_apps.iter().any(|&app| app_name.contains(app)) {
+                return true;
+            }
+        }
+    }
+    
+    #[cfg(target_os = "linux")]
+    {
+        // On Linux, we could use tools like xdotool or gdbus to check active windows
+        if let Ok(output) = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("xdotool getwindowfocus getwindowname 2>/dev/null || echo ''")
+            .output()
+        {
+            let window_name = String::from_utf8_lossy(&output.stdout).to_lowercase();
+            let common_text_apps = [
+                "terminal", "gnome-terminal", "konsole", "xterm", "gedit",
+                "kate", "libreoffice", "firefox", "chrome", "chromium",
+                "code", "sublime", "atom", "emacs", "vim", "discord",
+                "slack", "telegram", "document", "editor", "text"
+            ];
+            
+            if common_text_apps.iter().any(|&app| window_name.contains(app)) {
+                return true;
+            }
+        }
+    }
+    
+    // If we couldn't detect with platform-specific methods, fall back to true
+    // to not block transcription - users can enable strict mode if needed
+    true
+}
+
+
+// Add a function to load shortcuts from storage
+fn load_shortcuts_from_storage<R: Runtime>(app_handle: &AppHandle<R>) -> (String, String, String) {
+    // Default shortcuts
+    let default_toggle = "super+KeyG".to_string();
+    let default_hold = "super+KeyK".to_string();
+    let default_cancel = "super+KeyC".to_string(); // Default cancel shortcut
+    
+    // Try to get from store
+    match app_handle.store("settings.dat") {
+        Ok(store) => {
+            let toggle = store.get("toggle_shortcut")
+                .and_then(|v| v.as_str().map(|s| s.to_string()))
+                .unwrap_or(default_toggle.clone());
+                
+            let hold = store.get("hold_shortcut")
+                .and_then(|v| v.as_str().map(|s| s.to_string()))
+                .unwrap_or(default_hold.clone());
+                
+            let cancel = store.get("cancel_shortcut")
+                .and_then(|v| v.as_str().map(|s| s.to_string()))
+                .unwrap_or(default_cancel.clone());
+                
+            (toggle, hold, cancel)
+        }
+        Err(_) => (default_toggle, default_hold, default_cancel),
+    }
+}
+
+// Update the run function to load settings
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
-    // Fixed shortcuts
-    let fixed_toggle_shortcut = "super+KeyG".to_string();
-    let fixed_hold_shortcut = "super+KeyK".to_string();
-
     let app = tauri::Builder::default()
         .plugin(http_init())
         .plugin(shell_init())
         .plugin(opener_init())
-        .plugin(tauri_plugin_store::Builder::default().build()) // Add store plugin
+        .plugin(tauri_plugin_store::Builder::default().build())
         .setup(move |app| {
             #[cfg(desktop)]
             {
@@ -810,6 +1123,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     println!("Failed to initialize store, will use only env file");
                 }
+                
+                // Initialize settings store
+                let _ = app_handle.store("settings.dat");
 
                 // Try to get API key from environment or .env
                 if let Ok(api_key) = get_api_key(&app_handle) {
@@ -822,16 +1138,26 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
+                // Load shortcuts from storage
+                let (toggle_shortcut, hold_shortcut, cancel_shortcut) = load_shortcuts_from_storage(&app_handle);
+                println!(
+                    "Loaded shortcuts - toggle: {}, hold: {}, cancel: {}",
+                    toggle_shortcut, hold_shortcut, cancel_shortcut
+                );
+
                 // Set up system tray
                 if let Err(e) = setup_system_tray(&app_handle) {
                     eprintln!("Failed to set up system tray: {}", e);
                 }
 
                 app.manage(AppState {
-                    _shortcut: Arc::new(Mutex::new(fixed_toggle_shortcut.clone())),
-                    _hold_shortcut: Arc::new(Mutex::new(fixed_hold_shortcut.clone())),
+                    _shortcut: Arc::new(Mutex::new(toggle_shortcut.clone())),
+                    _hold_shortcut: Arc::new(Mutex::new(hold_shortcut.clone())),
+                    _cancel_shortcut: Arc::new(Mutex::new(cancel_shortcut.clone())),
                     is_recording: Arc::new(AtomicBool::new(false)),
+                    is_cancelled: Arc::new(AtomicBool::new(false)), // Track cancellation state
                     last_trigger: Arc::new(Mutex::new(None)),
+                    strict_text_field_mode: Arc::new(AtomicBool::new(false)),
                 });
 
                 let handle_clone = app_handle.clone();
@@ -842,10 +1168,13 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                         })
                         .build(),
                 )?;
+                
+                // Register shortcuts from storage
                 if let Err(e) = update_global_shortcut(
                     &app_handle,
-                    &fixed_toggle_shortcut,
-                    &fixed_hold_shortcut,
+                    &toggle_shortcut,
+                    &hold_shortcut,
+                    &cancel_shortcut
                 ) {
                     eprintln!("Failed to register global shortcuts: {}", e);
                 }
@@ -868,7 +1197,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         .invoke_handler(tauri::generate_handler![
             get_shortcut_config,
             update_shortcut_config,
-            record_audio
+            record_audio,
+            toggle_strict_text_field_mode,
+            get_strict_text_field_mode
         ])
         .build(tauri::generate_context!())?;
 
